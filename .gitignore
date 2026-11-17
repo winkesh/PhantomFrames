@@ -16,3 +16,5 @@ data720/
 %USERPROFILE%/
 weights/*.engine
 weights/*.calib
+# launch video project (/brag): footage, renders and working files, shared separately
+brag-output/
