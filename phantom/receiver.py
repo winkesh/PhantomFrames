@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import tilecodec as TC
 from . import tiles as T
 from .config import HEIGHT, N_TILES, WIDTH
 from .packet import FLAG_PARITY, Packet, bitmap_ids, unpack_tiles
@@ -20,7 +21,7 @@ class FrameState:
     parity: dict = field(default_factory=dict)    # group idx -> payload
     skip: set = field(default_factory=set)
     first_arrival: float | None = None
-    decoded: dict | None = None                   # tile_id -> decoded tile, filled by assemble()
+    decoded: tuple | None = None                  # (tile ids, stacked tiles), filled by assemble()
     _n_decoded: int = -1
 
     def add(self, p: Packet, now: float = 0.0) -> None:
@@ -61,24 +62,41 @@ class Assembled:
     any_packet: bool             # False when nothing at all arrived for this frame
 
 
-def assemble(state: FrameState | None, frame_id: int, prev: np.ndarray | None, pool=None) -> Assembled:
-    """Build the partial frame. Skipped (unchanged) tiles are copied from prev; lost tiles reported.
-    pool: optional ThreadPoolExecutor to JPEG-decode tiles in parallel (live app; no memoisation)."""
-    base = prev.copy() if prev is not None else np.zeros((HEIGHT, WIDTH, 3), np.uint8)
-    if state is None or not state.media and not state.parity:
-        return Assembled(frame_id, base, set(range(N_TILES)), False)
+def decode_state(state: FrameState, memo: bool) -> tuple[np.ndarray, np.ndarray]:
+    """JPEG-decode every tile that arrived, once per FrameState: (tile ids, (k, TILE, TILE, 3) tiles).
+    memo: reuse decodes of identical tile bytes (the simulator replays the same tiles across many runs);
+    the live app decodes fresh tiles, where the cache would only cost memory.
+    One thread on purpose: a 40x40 decode is so short that per-call overhead under the GIL dominates, and a
+    thread pool measured slower (9.8 ms single vs 10-13 ms pooled for 576 tiles at 720p)."""
     if state.decoded is None or len(state.media) != state._n_decoded:
         state.fec_recover()
         items = [(tid, data) for payload in state.media.values() for tid, data in unpack_tiles(payload)
                  if tid < N_TILES]
-        if pool is not None:
-            from .sender import chunked_map
-            tiles = chunked_map(pool, lambda its: [T.decode_tile_raw(d) for _, d in its], items)
+        if not memo and TC.NATIVE:            # live app: whole frame in one native call (same pixels as cv2)
+            ok, stack = TC.decode_tiles([d for _, d in items])
+            ids = np.asarray([tid for tid, _ in items], np.intp)
+            state.decoded = (ids[ok], stack[ok]) if not ok.all() else (ids, stack)
         else:
-            tiles = (T.decode_tile(data) for _, data in items)
-        state.decoded = {tid: tile for (tid, _), tile in zip(items, tiles) if tile is not None}
+            dec = T.decode_tile if memo else T.decode_tile_raw
+            ids, tiles = [], []
+            for tid, data in items:
+                tile = dec(data)
+                if tile is not None:
+                    ids.append(tid); tiles.append(tile)
+            stack = np.stack(tiles) if tiles else np.zeros((0, T.TILE, T.TILE, 3), np.uint8)
+            state.decoded = (np.asarray(ids, np.intp), stack)
         state._n_decoded = len(state.media)
-    for tid, tile in state.decoded.items():
-        T.paste(base, tid, tile)
-    missing = set(range(N_TILES)) - set(state.decoded) - state.skip
+    return state.decoded
+
+
+def assemble(state: FrameState | None, frame_id: int, prev: np.ndarray | None, pool=None,
+             memo: bool | None = None) -> Assembled:
+    """Build the partial frame. Skipped (unchanged) tiles are copied from prev; lost tiles reported.
+    memo: memoise tile decodes (default: on unless a pool is passed, as the live app used to)."""
+    base = prev.copy() if prev is not None else np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+    if state is None or not state.media and not state.parity:
+        return Assembled(frame_id, base, set(range(N_TILES)), False)
+    ids, stack = decode_state(state, memo=(pool is None) if memo is None else memo)
+    T.paste_many(base, ids, stack)
+    missing = set(range(N_TILES)) - set(ids.tolist()) - state.skip
     return Assembled(frame_id, base, missing, True)

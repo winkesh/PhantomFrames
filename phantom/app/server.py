@@ -41,6 +41,34 @@ def ffmpeg_exe() -> str:
         return "ffmpeg"
 
 
+ENCODER = "auto"                     # browser stream encoder: auto | nvenc | x264 (--encoder)
+_nvenc_ok: bool | None = None
+
+
+def nvenc_available() -> bool:
+    """True when this ffmpeg has h264_nvenc and an NVIDIA GPU actually opens it (tested once, ~0.3 s)."""
+    global _nvenc_ok
+    if _nvenc_ok is None:
+        try:
+            r = subprocess.run([ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                                f"color=size={2 * WIDTH}x{HEIGHT}:rate=30", "-frames:v", "2", "-c:v", "h264_nvenc",
+                                "-f", "null", "-"], capture_output=True, timeout=20)
+            _nvenc_ok = r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _nvenc_ok = False
+    return _nvenc_ok
+
+
+def h264_encoder_args(rate: str, level: str) -> list[str]:
+    """NVENC moves the side-by-side H.264 encode off the CPU (the CPU is what limits the demo above 360p);
+    libx264 is the fallback for machines without an NVIDIA GPU."""
+    common = ["-profile:v", "high", "-level:v", level, "-pix_fmt", "yuv420p", "-g", "30", "-bf", "0",
+              "-b:v", rate, "-maxrate", rate, "-bufsize", "4M"]
+    if ENCODER == "nvenc" or (ENCODER == "auto" and nvenc_available()):
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-rc", "cbr", "-zerolatency", "1", *common]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", *common]
+
+
 def find_samples() -> dict[str, Path]:
     # the highest-resolution copy of the test clips that is not above the stream (smaller ones are upscaled)
     roots = [Path(f"data{r}/test") for r in (1080, 720) if r <= RES] + [Path("data/test")]
@@ -239,9 +267,7 @@ class Handler(BaseHTTPRequestHandler):
             scale, rate = [], {360: "4M", 720: "10M", 1080: "20M"}[RES]
         level = "5.1" if w * h > 8192 * 256 else "4.0"     # 3840x1080 side by side needs level 5.1
         cmd = [ffmpeg_exe(), "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
-               "-r", "30", "-i", "-", *scale, "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-               "-profile:v", "high", "-level:v", level, "-pix_fmt", "yuv420p", "-g", "30", "-bf", "0",
-               "-b:v", rate, "-maxrate", rate, "-bufsize", "4M",
+               "-r", "30", "-i", "-", *scale, *h264_encoder_args(rate, level),
                "-f", "mp4", "-movflags", "empty_moov+default_base_moof+frag_keyframe", "-frag_duration", "100000", "-"]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         stop = threading.Event()
@@ -312,11 +338,21 @@ def main():
                     help="stream resolution (360p runs at 30 fps on a laptop; 720p/1080p need a stronger CPU)")
     ap.add_argument("--repair-res", default="auto", choices=["auto", "full", "360"],
                     help="auto: repair at 360p when full-resolution repair is too slow for this GPU")
+    ap.add_argument("--single-process", action="store_true",
+                    help="run sender and receiver as threads in this process (slower above 360p; for debugging)")
+    ap.add_argument("--encoder", default="auto", choices=["auto", "nvenc", "x264"],
+                    help="H.264 encoder for the browser stream: NVENC on an NVIDIA GPU, else libx264")
     a = ap.parse_args()
-    ENGINE = Engine(a.weights, a.framegen, udp_port=a.udp_port, backend=a.backend, repair_res=a.repair_res)
+    global ENCODER
+    ENCODER = a.encoder
+    ENGINE = Engine(a.weights, a.framegen, udp_port=a.udp_port, backend=a.backend, repair_res=a.repair_res,
+                    processes=not a.single_process)
     rn = ENGINE.models.get("repairnet")
     if rn is not None:
         print(f"RepairNet runs on {rn.label}", flush=True)
+    enc = "h264_nvenc (GPU)" if "h264_nvenc" in h264_encoder_args("1M", "4.0") else "libx264 (CPU)"
+    print(f"sender and receiver run in their own processes; browser stream encoded with {enc}"
+          if ENGINE.processes else f"single process; browser stream encoded with {enc}", flush=True)
     if ENGINE.rx is not None:
         print(f"listening for senders on UDP {a.udp_port}; on another machine run:  python -m phantom.send"
               f"   (or --to {ENGINE.ips[0] if ENGINE.ips else '<this IP>'})", flush=True)

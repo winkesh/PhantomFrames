@@ -18,3 +18,5 @@ weights/*.engine
 weights/*.calib
 # launch video project (/brag): footage, renders and working files, shared separately
 brag-output/
+# third-party sources and objects for python -m tools.build_native (the built .pyd is kept)
+build/

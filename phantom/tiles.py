@@ -52,12 +52,55 @@ def paste(frame: np.ndarray, tid: int, tile: np.ndarray) -> None:
     frame[y0:y1, x0:x1] = tile
 
 
+# ---- whole-frame tile operations, vectorised: a frame seen as a (rows, TILE, cols, TILE, 3) grid of tiles, so
+# copying, blanking or pasting k tiles is one indexed assignment touching only those tiles (a masked copy over a
+# 720p frame costs ~4 ms; this costs ~0.1 ms for a typical 10% loss).
+
+def tile_view(frame: np.ndarray) -> np.ndarray:
+    """(TILES_Y, TILE, TILES_X, TILE, 3) view of a contiguous HxWx3 frame (writes go to the frame)."""
+    return frame.reshape(TILES_Y, TILE, TILES_X, TILE, frame.shape[2])
+
+
+def tile_grid(mask: np.ndarray) -> np.ndarray:
+    """(TILES_Y, TILES_X) bool grid from a tile-aligned HxW pixel mask."""
+    return mask[::TILE, ::TILE]
+
+
+def tile_coords(tids) -> tuple[np.ndarray, np.ndarray]:
+    t = np.asarray(sorted(tids) if isinstance(tids, (set, frozenset)) else tids, dtype=np.intp)
+    return t // TILES_X, t % TILES_X
+
+
+def copy_tiles(dst: np.ndarray, src: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    """dst's tiles where grid is True replaced by src's (in place); returns dst."""
+    ys, xs = np.nonzero(grid)
+    if len(ys):
+        tile_view(dst)[ys, :, xs] = tile_view(src)[ys, :, xs]
+    return dst
+
+
+def fill_tiles(dst: np.ndarray, grid: np.ndarray, value: int = 0) -> np.ndarray:
+    ys, xs = np.nonzero(grid)
+    if len(ys):
+        tile_view(dst)[ys, :, xs] = value
+    return dst
+
+
+def paste_many(frame: np.ndarray, tids: np.ndarray, stack: np.ndarray) -> None:
+    """Paste stack[k] (TILE x TILE x 3) at tile tids[k], for all k at once."""
+    if len(tids):
+        ys, xs = tile_coords(tids)
+        tile_view(frame)[ys, :, xs] = stack
+
+
 def tile_mask_to_pixels(missing: set[int] | np.ndarray) -> np.ndarray:
     """Boolean HxW mask, True where pixels are missing."""
     m = np.zeros((TILES_Y, TILES_X), bool)
-    for tid in missing:
-        m[tid // TILES_X, tid % TILES_X] = True
-    return np.kron(m, np.ones((TILE, TILE), bool))
+    if len(missing):
+        ys, xs = tile_coords(missing)
+        m[ys, xs] = True
+    return np.ascontiguousarray(np.broadcast_to(m[:, None, :, None], (TILES_Y, TILE, TILES_X, TILE))
+                                ).reshape(HEIGHT, WIDTH)
 
 
 def resize_frame(img: np.ndarray) -> np.ndarray:

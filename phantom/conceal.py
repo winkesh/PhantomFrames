@@ -14,6 +14,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import tiles as T
+
 
 class Concealer:
     name = "base"
@@ -27,9 +29,7 @@ class NoRecovery(Concealer):
     name = "none"
 
     def __call__(self, partial, mask, history):
-        out = partial.copy()
-        np.copyto(out, 0, where=mask[..., None])   # much faster than boolean indexing on large frames
-        return out
+        return T.fill_tiles(partial.copy(), T.tile_grid(mask), 0)   # only the lost tiles are touched
 
 
 class Freeze(Concealer):
@@ -153,8 +153,7 @@ class RepairNetConcealer(Concealer):
         pred = np.clip(y[0].transpose(1, 2, 0)[..., ::-1] * 255 + 0.5, 0, 255).astype(np.uint8)
         if resize:
             pred = cv2.resize(pred, (w, h), interpolation=cv2.INTER_LINEAR)
-        out = partial.copy()
-        out[mask] = pred[mask]
+        out = T.copy_tiles(partial.copy(), pred, T.tile_grid(mask))
         self.times_ms.append((time.perf_counter() - t0) * 1000)
         return out
 
@@ -182,8 +181,7 @@ class RepairNetConcealer(Concealer):
             y = self.runner(self._t(small(prev2)), self._t(small(prev1)), self._t(small(partial)), m)
             pred = (y[0].flip(0).float().clamp(0, 1) * 255 + 0.5).byte().permute(1, 2, 0).contiguous().cpu().numpy()
         pred = cv2.resize(pred, (w, h), interpolation=cv2.INTER_LINEAR)
-        out = partial.copy()
-        np.copyto(out, pred, where=mask[..., None])
+        out = T.copy_tiles(partial.copy(), pred, T.tile_grid(mask))   # paste the prediction into lost tiles only
         self.times_ms.append((time.perf_counter() - t0) * 1000)
         return out
 

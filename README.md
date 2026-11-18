@@ -72,7 +72,7 @@ Runs on any machine with the Python environment above; a CUDA GPU makes it real 
 service is needed. Then open the address it prints in a browser.
 ```bash
 python -m phantom.app                                  # 360p, http://127.0.0.1:8000 (any laptop GPU)
-python -m phantom.app --res 720                        # 720p or 1080p: needs a stronger CPU, see below
+python -m phantom.app --res 720                        # 720p (30 fps on the laptop below) or 1080p
 python -m phantom.app --host 0.0.0.0 --port 8000       # also reachable from other devices on the network
 ```
 By default the app picks the fastest repair backend on the machine (`--backend auto`: a TensorRT engine if
@@ -81,12 +81,30 @@ larger. How far the resolution goes was measured on the running demo (game clip,
 
 | Machine | 360p | 720p | 1080p |
 |---|---|---|---|
-| Laptop: i5-12450HX + RTX 3050, TensorRT FP16 | 30 fps | 12-14 fps | below that |
+| Laptop: i5-12450HX + RTX 3050, TensorRT FP16 | 30 fps | 30 fps (was 12-14) | 22-23 fps (was below 12) |
 | Desktop: 16 cores + RTX 5060 Ti, TensorRT INT8+FP16 | 30 fps | 30 fps | 23 fps |
 
-Above 360p the limit is the CPU, not the GPU: every 720p frame is 576 JPEG tiles and packets (1080p: 1296), and
-sending, receiving and the browser's H.264 stream share one Python process. `python -m tools.res_bench` times
-each stage on a machine.
+(Desktop row measured before the changes below.) Above 360p the limit is the CPU, not the GPU: every 720p frame
+is 576 JPEG tiles and packets (1080p: 1296). Four things keep 720p at 30 fps on a laptop:
+* **A native batch tile codec** (`phantom/native/_tilecodec.cpp`, libjpeg-turbo with SIMD) encodes or decodes a
+  whole frame's tiles in one call on several threads, instead of one Python call per tile. It writes byte-identical
+  JPEGs to `cv2.imencode` and decodes to identical pixels, so results do not change; it is ~4x faster
+  (720p: 7 -> 1.8 ms each way, 1080p: 16 -> 3.6 ms). A prebuilt copy for Python 3.12 on Windows x64 is in the
+  repo; `python -m tools.build_native` rebuilds it (Visual Studio with C++). Without it, the demo falls back to
+  OpenCV automatically (`PHANTOM_NATIVE_CODEC=0` forces that).
+* **Sender and receiver run in their own processes**, like two machines, with the web server, source reader and
+  UDP listener in a third. Tile coding is ~1,000 tiny OpenCV calls a frame, which threads in one Python process
+  could not run in parallel (a thread pool was measured slower than one thread). Frames move between processes
+  through shared memory; only the packets (~100 KB a frame) go through queues. `--single-process` restores the
+  old threaded layout.
+* **The browser stream is encoded with NVENC** on NVIDIA GPUs (`--encoder auto|nvenc|x264`), freeing the CPU.
+* **Tile operations are vectorised**: pasting, blanking and repairing only the lost tiles is one indexed array
+  assignment instead of a masked copy of the whole frame (repair 21 -> 12 ms, the "no repair" panel 9 -> 0.8 ms).
+
+On Windows 11 the worker processes also opt out of power throttling ("efficiency mode"): without it, Windows
+runs windowless background processes on slower cores at lower clocks, and the receiver ran 2-3x slower.
+`python -m tools.live_bench --res 720` measures the delivered frame rate end to end; `python -m tools.stage_profile`
+(with `PHANTOM_RES=720`) times each step of the sender and receiver.
 `--host 0.0.0.0` lets a phone or another laptop on the same network open `http://<this-machine's-IP>:8000`;
 any network path between the browser and the server works (LAN, VPN, port forward).
 Upload any video or paste a stream URL (`.mp4`, HLS `.m3u8`, `rtsp://`). Each frame goes through the real
@@ -191,8 +209,9 @@ phantom/        core library
   live/         real UDP sender and receiver (discovery, playout, feedback), lossy relay
   app/          the demo: web server, streaming engine, page (also the receiver for other machines)
   send.py       python -m phantom.send: stream a webcam or file to the demo on another machine
+  tilecodec.py  whole-frame tile JPEG coding: native batch codec (native/) or OpenCV fallback
 train/          RepairNet training
 eval/           experiment runner and plots
-tools/          clip download/preparation, demo video renderer
+tools/          clip download/preparation, demo video renderer, benchmarks, native build
 tests/          unit tests
 ```

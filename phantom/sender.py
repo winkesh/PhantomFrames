@@ -6,6 +6,7 @@ import random
 
 import numpy as np
 
+from . import tilecodec as TC
 from . import tiles as T
 from .config import CLOCK_HZ, FPS, MAX_PAYLOAD, N_TILES
 from .packet import FLAG_PARITY, FLAG_RETX, Packet, bitmap_from, pack_tiles
@@ -90,7 +91,9 @@ class Packetizer:
     def packetize(self, frame: np.ndarray, send_us: int = 0) -> list[Packet]:
         tiles = T.split(frame)
         send_ids, skip_ids = self._choose_tiles(tiles)
-        if self.pool is not None:     # cv2 releases the GIL: encode tiles in 8 parallel batches
+        if TC.NATIVE:                 # one call for the whole frame, native threads (same bytes as cv2.imencode)
+            coded = dict(zip(send_ids, TC.encode_tiles(frame, send_ids, self.quality)))
+        elif self.pool is not None:   # cv2 releases the GIL: encode tiles in 8 parallel batches
             enc = lambda ids: [T.encode_tile(tiles[i], self.quality) for i in ids]
             coded = dict(zip(send_ids, chunked_map(self.pool, enc, send_ids)))
         else:
