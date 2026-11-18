@@ -120,11 +120,14 @@ on the same Wi-Fi or hotspot, in the same page and with the same controls.
 
 1. **Receiving machine** (ideally the one with an NVIDIA GPU): start the demo and open it in the browser.
    ```bash
-   python -m phantom.app
+   python -m phantom.app --res 720
    ```
-2. **Sending machine** (the repo installed too): stream its webcam. It finds the receiver by itself.
+2. **Sending machine** (the repo installed too): stream its webcam, or any video. It finds the receiver by
+   itself and matches the receiver's resolution, so nothing needs setting on this side.
    ```bash
-   python -m phantom.send
+   python -m phantom.send                      # webcam (asks the camera for 1280x720 at 30 fps)
+   python -m phantom.send --src movie.mp4      # any video file, looped, at its own frame rate
+   python -m phantom.send --src rtsp://...     # or a stream URL (http, HLS .m3u8, RTSP)
    ```
 
 The page switches to *Live from &lt;sender's IP&gt;* as soon as packets arrive: left without Phantom, right with
@@ -136,7 +139,14 @@ live stream; *Watch* under the samples goes back to it.
 `python -m phantom.send --src video.mp4` streams a file instead of the webcam. If the sender says
 *No receiver found* (some networks block broadcasts), give the address the demo printed when it started:
 `python -m phantom.send --to 192.168.1.42`. The first time, Windows asks whether Python may use the network:
-allow it (a phone hotspot is a *public* network). Both machines must use the same `PHANTOM_RES` (default 360p).
+allow it (a phone hotspot is a *public* network). The sender asks the receiver for its resolution (`--res` overrides
+it); a 60 fps file is sent as every second frame, and a 24 or 25 fps film at its own speed.
+
+**Bandwidth.** Every 40×40 tile is a complete JPEG, and about 88% of its ~700 bytes are the JPEG header tables, so
+the rate depends mostly on how many tiles change, not on `--quality`: a high-motion 720p video needs ~90 Mbit/s
+(360p: ~25), while a webcam on a mostly still scene sends far less because unchanged tiles are skipped. Use
+Ethernet or 5 GHz Wi-Fi for 720p video; on a phone hotspot, 360p is the safe choice. Measured on one laptop
+(sender and receiver both local): 720p game clip at 30 fps end to end.
 
 Optional: `python -m phantom.live.relay` sits between the two to add delay and jitter
 (`python -m phantom.live.relay --help`); point the sender at it with `--to`.

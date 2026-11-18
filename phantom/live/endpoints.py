@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import socket
 import threading
 import time
@@ -10,40 +11,20 @@ from collections import deque
 import cv2
 import numpy as np
 
-from ..config import FPS, FRAME_MS, N_TILES
+from ..config import FPS, FRAME_MS, HEIGHT, N_TILES
 from ..packet import Packet
 from ..receiver import FrameState, assemble
 from ..sender import Packetizer
 from ..tiles import letterbox, tile_mask_to_pixels
+from .discovery import ANNOUNCE, DISCOVER, announce, local_ips  # noqa: F401
 
-DISCOVER = b"PHANTOM-FRAMES?"      # sender -> broadcast: is there a receiver on this network?
-ANNOUNCE = b"PHANTOM-FRAMES!"      # receiver -> sender: yes, here
-
-
-def local_ips() -> list[str]:
-    """This machine's LAN addresses (the default route's first)."""
-    ips = []
-    try:                                    # the address of the default route (no packet is sent)
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ips.append(s.getsockname()[0])
-        s.close()
-    except OSError:
-        pass
-    try:
-        ips += socket.gethostbyname_ex(socket.gethostname())[2]
-    except OSError:
-        pass
-    seen, out = set(), []
-    for ip in ips:
-        if ip not in seen and not ip.startswith(("127.", "169.254.")):
-            seen.add(ip)
-            out.append(ip)
-    return out
+# discovery lives in its own module (no phantom.config import): re-exported here for older imports
 
 
 class FrameSource:
-    """Loops a video file, or reads a webcam if path is an int / digit string."""
+    """A webcam (int / digit string), or any video OpenCV can open: a file (loops), an http(s) / HLS / RTSP URL.
+    Frames are letterboxed to the stream resolution; sources above ~30 fps are decimated (60 fps -> every 2nd
+    frame), and out_fps is the rate the sender should pace at, so a 24 or 25 fps film plays at its own speed."""
 
     def __init__(self, src):
         self.src = src
@@ -51,12 +32,19 @@ class FrameSource:
         self.cap = cv2.VideoCapture(str(src) if self.is_file else int(src))
         if not self.cap.isOpened():
             raise RuntimeError(f"cannot open {'video ' + str(src) if self.is_file else 'webcam ' + str(src)}")
-        if not self.is_file:          # most webcams default to 640x480; ask for 16:9 HD instead
+        if not self.is_file:          # most webcams default to 640x480; ask for 16:9 HD at 30 fps instead
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        fps = fps if 1 < fps < 241 else float(FPS)
+        self.stride = max(1, round(fps / FPS)) if self.is_file else 1
+        self.out_fps = min(float(FPS), fps / self.stride) if self.is_file else float(FPS)
+        self.size = (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
     def read(self) -> np.ndarray:
+        for _ in range(self.stride - 1):
+            self.cap.grab()
         ok, img = self.cap.read()
         if not ok and self.is_file:   # loop: reopen rather than seek (seeking is unreliable in some codecs)
             self.cap.release()
@@ -68,10 +56,10 @@ class FrameSource:
 
 
 class LiveSender:
-    def __init__(self, src, dst: tuple[str, int], quality=75, cr_threshold=2.0, fps=FPS, originals=None):
+    def __init__(self, src, dst: tuple[str, int], quality=75, cr_threshold=2.0, fps=None, originals=None):
         self.source = FrameSource(src)
         self.dst = dst
-        self.fps = fps
+        self.fps = fps or self.source.out_fps
         self.pk = Packetizer(quality=quality, interleave=True, cr_threshold=cr_threshold)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 << 20)
@@ -81,6 +69,8 @@ class LiveSender:
         self.reported_loss = 0.0
         self.last_feedback = 0.0          # time.time() of the last loss report from the receiver
         self._stop = threading.Event()
+        self._lock = threading.Lock()          # packetizer state is shared with the feedback reader
+        self._out: queue.Queue = queue.Queue(maxsize=2)   # packets of frames waiting to be paced out
 
     def _poll_feedback(self):
         while True:
@@ -95,9 +85,13 @@ class LiveSender:
             self.reported_loss = fb.get("loss", 0.0)
             self.last_feedback = time.time()
             # loss-aware refresh: tiles the receiver lost are re-sent next frame even if unchanged
-            self.pk.force_refresh.update(fb.get("lost_tiles", []))
+            with self._lock:
+                self.pk.force_refresh.update(fb.get("lost_tiles", []))
 
     def run(self):
+        """Capture + packetize at the source's frame rate; the pacer thread sends the packets. Splitting the two
+        lets frame N go out while frame N+1 is prepared (the tile codec and sendto both release the GIL): one
+        loop doing both could not fit 720p reading, coding and paced sending into 33 ms."""
         t_next = time.perf_counter()
         t0 = t_next
         while not self._stop.is_set():
@@ -107,16 +101,12 @@ class LiveSender:
                 self.originals[fid] = img
                 self.originals.pop(fid - 120, None)
             send_us = int((time.perf_counter() - t0) * 1e6)   # capture time on the sender clock
-            pkts = self.pk.packetize(img, send_us=send_us)
-            # pace evenly over half a frame interval, against an absolute schedule (no drift)
-            t_start, gap = time.perf_counter(), (0.5 / self.fps) / max(1, len(pkts))
-            for i, p in enumerate(pkts):
-                while time.perf_counter() < t_start + i * gap:
-                    time.sleep(0)   # yield the GIL: receiver/relay/display may share this process
-                b = p.encode()
-                self.sock.sendto(b, self.dst)
-                self.bytes_sent += len(b)
-            self._poll_feedback()
+            with self._lock:
+                pkts = self.pk.packetize(img, send_us=send_us)
+            try:
+                self._out.put(pkts, timeout=1.0)
+            except queue.Full:                 # the network cannot take this rate: drop the frame, keep time
+                pass
             t_next += 1.0 / self.fps
             dt = t_next - time.perf_counter()
             if dt > 0:
@@ -124,8 +114,27 @@ class LiveSender:
             else:
                 t_next = time.perf_counter()
 
+    def _pace(self):
+        """Send each frame's packets evenly over 80% of a frame interval: at 720p a frame is ~350 packets, and a
+        burst of them in a few ms overflows Wi-Fi and switch queues. Sleeps between clumps (no busy-wait)."""
+        while not self._stop.is_set():
+            try:
+                pkts = self._out.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            t_start, gap = time.perf_counter(), (0.8 / self.fps) / max(1, len(pkts))
+            for i, p in enumerate(pkts):
+                wait = t_start + i * gap - time.perf_counter()
+                if wait > 0.001:                # packets due within 1 ms go out together (~10-15 at 720p)
+                    time.sleep(wait)
+                b = p.encode()
+                self.sock.sendto(b, self.dst)
+                self.bytes_sent += len(b)
+            self._poll_feedback()
+
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
+        threading.Thread(target=self._pace, daemon=True).start()
         return self
 
     def stop(self):
@@ -194,8 +203,8 @@ class LiveReceiver:
         try:
             while True:
                 data, addr = self.sock.recvfrom(65535)
-                if data == DISCOVER:          # a sender looking for a receiver on this network
-                    self.sock.sendto(ANNOUNCE, addr)
+                if data == DISCOVER:          # a sender looking for a receiver: say where, and at what resolution
+                    self.sock.sendto(announce(HEIGHT), addr)
                     continue
                 try:
                     p = Packet.decode(data)

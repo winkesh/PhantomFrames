@@ -4,11 +4,12 @@ from __future__ import annotations
 import math
 import random
 
+import cv2
 import numpy as np
 
 from . import tilecodec as TC
 from . import tiles as T
-from .config import CLOCK_HZ, FPS, MAX_PAYLOAD, N_TILES
+from .config import CLOCK_HZ, FPS, MAX_PAYLOAD, N_TILES, TILE, TILES_X, TILES_Y
 from .packet import FLAG_PARITY, FLAG_RETX, Packet, bitmap_from, pack_tiles
 
 DIR_OVERHEAD = 1  # tile-count byte
@@ -65,32 +66,39 @@ class Packetizer:
         # conditional replenishment: skip tiles that barely changed since last sent
         self.cr_threshold = cr_threshold
         self.refresh = refresh
-        self._last_sent: list[np.ndarray | None] = [None] * N_TILES
-        self._age = [0] * N_TILES
+        self._last_sent: np.ndarray | None = None   # the frame as last sent, tile by tile
+        self._age = np.zeros(N_TILES, np.int64)
         self.force_refresh: set[int] = set()   # tiles the receiver reported lost
         self._history: dict[int, Packet] = {}  # seq -> packet, for NACK retransmission
         self.pool = None                       # optional ThreadPoolExecutor for tile encoding
 
-    def _choose_tiles(self, tiles: list[np.ndarray]) -> tuple[list[int], list[int]]:
+    def _choose_tiles(self, frame: np.ndarray) -> tuple[list[int], list[int]]:
+        """Conditional replenishment, vectorised over the whole frame: a tile is sent when its mean absolute
+        change since it was last sent exceeds cr_threshold, when it is `refresh` frames old, or when the
+        receiver reported it lost; otherwise it is skipped (the receiver keeps its copy)."""
         if self.cr_threshold <= 0:
             return list(range(N_TILES)), []
-        send, skip = [], []
-        for i, t in enumerate(tiles):
-            last = self._last_sent[i]
-            changed = last is None or np.abs(t.astype(np.int16) - last).mean() > self.cr_threshold
-            if changed or self._age[i] >= self.refresh or i in self.force_refresh:
-                send.append(i)
-                self._last_sent[i] = t.astype(np.int16)
-                self._age[i] = 0
-            else:
-                skip.append(i)
-                self._age[i] += 1
+        cur = np.ascontiguousarray(frame)
+        if self._last_sent is None:
+            send = np.ones(N_TILES, bool)
+            self._last_sent = cur.copy()
+        else:
+            # |cur - last| in uint8 (exact), then exact integer sums per tile: each tile row is TILE*3 contiguous bytes
+            d = cv2.absdiff(cur, self._last_sent).reshape(TILES_Y, TILE, TILES_X, TILE * 3)
+            mean = d.sum(axis=(1, 3), dtype=np.uint32).ravel() / (TILE * TILE * 3)
+            send = (mean > self.cr_threshold) | (self._age >= self.refresh)
+            if self.force_refresh:
+                send[[i for i in self.force_refresh if 0 <= i < N_TILES]] = True
+            T.copy_tiles(self._last_sent, cur, send.reshape(TILES_Y, TILES_X))
+        self._age[send] = 0
+        self._age[~send] += 1
         self.force_refresh.clear()
-        return send, skip
+        ids = np.arange(N_TILES)
+        return ids[send].tolist(), ids[~send].tolist()
 
     def packetize(self, frame: np.ndarray, send_us: int = 0) -> list[Packet]:
         tiles = T.split(frame)
-        send_ids, skip_ids = self._choose_tiles(tiles)
+        send_ids, skip_ids = self._choose_tiles(frame)
         if TC.NATIVE:                 # one call for the whole frame, native threads (same bytes as cv2.imencode)
             coded = dict(zip(send_ids, TC.encode_tiles(frame, send_ids, self.quality)))
         elif self.pool is not None:   # cv2 releases the GIL: encode tiles in 8 parallel batches
